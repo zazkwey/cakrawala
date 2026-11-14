@@ -19,8 +19,29 @@ st.caption("Harmonisasi MODIS & VIIRS · data titik api NASA FIRMS · 2000–202
 
 
 # ======================================================================
-# 1. BACA DATA
+# 1. BACA DATA (DENGAN CACHE)
 # ======================================================================
+
+@st.cache_data
+def muat_kalender(kode_area):
+    df = pd.read_csv(f"kalender_{kode_area}.csv")
+    # Pengaman ganda: jika archive dan nrt tumpang-tindih di bulan yang sama, buang nrt
+    if "jenis" in df.columns:
+        sudah_archive = (
+            df[df["jenis"] == "archive"][["sensor", "tahun", "bulan"]]
+            .drop_duplicates()
+            .assign(_ada_archive=True)
+        )
+        df = df.merge(sudah_archive, on=["sensor", "tahun", "bulan"], how="left")
+        df = df[~((df["jenis"] == "nrt") & (df["_ada_archive"] == True))]
+        df = df.drop(columns=["_ada_archive"])
+    return df
+
+
+@st.cache_data
+def muat_peta(kode_area):
+    return pd.read_csv(f"peta_{kode_area}.csv")
+
 
 AREA = {
     "Indonesia": "indonesia",
@@ -31,24 +52,28 @@ AREA = {
     "Papua": "papua",
 }
 
-kolom_kiri, kolom_kanan = st.columns(2)
+kolom_kiri, kolom_tengah, kolom_kanan = st.columns([1.2, 1, 1.3])
 with kolom_kiri:
     nama_area = st.selectbox("Area", list(AREA.keys()),
                              index=list(AREA).index("Kalimantan Tengah"))
-with kolom_kanan:
+with kolom_tengah:
     satuan = st.radio("Satuan kalender", ["Skala VIIRS", "Skala MODIS"],
                       horizontal=True)
+with kolom_kanan:
+    filter_pita = st.radio(
+        "Tingkat kepercayaan",
+        ["Semua (l, n, h)", "Sedang & tinggi (n, h)"],
+        horizontal=True,
+    )
 
-d = pd.read_csv(f"kalender_{AREA[nama_area]}.csv")
+d = muat_kalender(AREA[nama_area])
+if filter_pita == "Sedang & tinggi (n, h)":
+    d = d[d["pita"].isin(["n", "h"])]
 
 
 # ======================================================================
 # 2. SUSUN JADI TABEL tahun-bulan x sensor
 # ======================================================================
-
-# PILIHAN METODE: semua pita kepercayaan dipakai (l, n, h).
-# Kalau mau menyaring, ganti baris di bawah ini, misalnya:
-#     d = d[d["pita"].isin(["n", "h"])]
 
 per_sensor = (
     d.groupby(["tahun", "bulan", "sensor"])["n"].sum()
@@ -56,16 +81,15 @@ per_sensor = (
     .fillna(0)
 )
 
-for s in ["MODIS", "VIIRS_SNPP", "VIIRS_NOAA20"]:
+kolom_viirs = ["VIIRS_SNPP", "VIIRS_NOAA20", "VIIRS_NOAA21"]
+for s in ["MODIS"] + kolom_viirs:
     if s not in per_sensor.columns:
         per_sensor[s] = 0.0
 
-# Gabungkan dua satelit VIIRS jadi satu kolom.
-# S-NPP dipakai lebih dulu; NOAA-20 mengisi saat S-NPP tidak ada
-# (S-NPP berhenti 2 November 2026).
-per_sensor["VIIRS"] = per_sensor["VIIRS_SNPP"].where(
-    per_sensor["VIIRS_SNPP"] > 0, per_sensor["VIIRS_NOAA20"]
-)
+# Gabungkan satelit-satelit VIIRS dengan mengambil cakupan terbanyak di tiap bulan.
+# Menghindari bug saat S-NPP berhenti 2 Nov 2026 (2 hari S-NPP tidak menimpa
+# satu bulan penuh data NOAA-20).
+per_sensor["VIIRS"] = per_sensor[kolom_viirs].max(axis=1)
 
 
 # ======================================================================
@@ -75,19 +99,19 @@ per_sensor["VIIRS"] = per_sensor["VIIRS_SNPP"].where(
 # Hanya bulan-bulan ketika KEDUA sensor sama-sama mendeteksi.
 tumpang = per_sensor[(per_sensor["MODIS"] > 0) & (per_sensor["VIIRS"] > 0)]
 
-# PILIHAN METODE: rasio dihitung dari TOTAL, bukan rata-rata rasio bulanan.
-# Alasan: bulan dengan sedikit kebakaran menghasilkan rasio yang liar
-# (3 banding 1 = 3,0), dan merata-ratakannya memberi bobot sama pada
-# bulan sepi dan bulan puncak. Total memberi bobot sesuai aktivitas.
-rasio = tumpang["VIIRS"].sum() / tumpang["MODIS"].sum()
+# Rasio dihitung dari TOTAL, bukan rata-rata rasio bulanan, agar bulan
+# sepi tidak menghasilkan rasio ekstrem yang membebani rata-rata.
+rasio = (
+    tumpang["VIIRS"].sum() / tumpang["MODIS"].sum()
+    if len(tumpang) and tumpang["MODIS"].sum() > 0
+    else 1.0
+)
 
 
 # ======================================================================
 # 4. HARMONISASI
 # ======================================================================
 
-# Aturan: pakai VIIRS bila ada (lebih tajam); bila tidak ada,
-# naikkan MODIS dengan rasio supaya setara skala VIIRS.
 harmoni_viirs = per_sensor["VIIRS"].where(
     per_sensor["VIIRS"] > 0, per_sensor["MODIS"] * rasio
 )
@@ -104,24 +128,24 @@ else:
 # 5. TAMPILKAN
 # ======================================================================
 
-# ---- angka pembuka: yang membuat orang berhenti menggulir ----
 per_tahun = harmoni.groupby("tahun").sum()
 per_bulan = harmoni.groupby("bulan").sum()
 
+jumlah_tahun = len(per_tahun)
 tahun_ini = int(per_tahun.index.max())
 peringkat = int((per_tahun > per_tahun.loc[tahun_ini]).sum()) + 1
-musim = per_bulan.loc[[8, 9, 10]].sum() / per_bulan.sum() * 100
+musim = per_bulan.loc[per_bulan.index.isin([8, 9, 10])].sum() / per_bulan.sum() * 100
 bulan_puncak = BULAN[int(per_bulan.idxmax()) - 1]
 
 h1, h2, h3 = st.columns(3)
-h1.metric(f"Kebakaran terjadi di Agu–Okt", f"{musim:.0f}%",
-          help="Bagian dari seluruh deteksi 26 tahun yang jatuh di tiga bulan ini")
-h2.metric(f"Peringkat {tahun_ini} dalam 26 tahun", f"ke-{peringkat}",
+h1.metric("Kebakaran terjadi di Agu–Okt", f"{musim:.0f}%",
+          help=f"Bagian dari seluruh deteksi {jumlah_tahun} tahun yang jatuh di tiga bulan ini")
+h2.metric(f"Peringkat {tahun_ini} dalam {jumlah_tahun} tahun", f"ke-{peringkat}",
           help="Semakin kecil, semakin parah")
 h3.metric("Bulan terparah sepanjang sejarah", bulan_puncak)
 
 st.markdown(
-    f"""
+    """
 Kebakaran gambut Indonesia tidak menyebar seperti kebakaran hutan biasa.
 Apinya **membara di bawah permukaan** — tanpa nyala, pada suhu jauh lebih
 rendah, dan bisa bertahan berbulan-bulan setelah asap di permukaan hilang.
@@ -129,7 +153,7 @@ rendah, dan bisa bertahan berbulan-bulan setelah asap di permukaan hilang.
 Jejak panas permukaannya kecil. Justru karena itu, satelit dengan piksel
 besar sering **melewatkannya**.
 
-> *[ISI SENDIRI — satu paragraf: kenapa ini penting bagi orang yang tinggal
+> Ini sangat penting bagi orang yang tinggal di dekatnya karena bla bla plis tambahin krpc
 > di sana, dan apa yang bisa dilakukan petugas dengan kalender ini.]*
 """
 )
@@ -153,6 +177,9 @@ mudah. Akibatnya, pada wilayah dan periode yang sama VIIRS mencatat
 Selisih itu berasal dari sensornya, bukan dari jumlah kebakaran. Menjumlahkan
 keduanya mentah-mentah akan memunculkan lonjakan palsu pada 2012, saat VIIRS
 mulai mengudara. Rasio di atas dipakai untuk menghapus lonjakan itu.
+
+*Catatan spasial: penyaringan wilayah menggunakan batas kotak koordinat (bounding box),
+sehingga area perbatasan darat negara tetangga ikut tercakup secara agregat.*
         """
     )
 
@@ -168,7 +195,7 @@ def gambar(grid, judul):
     fig = px.imshow(
         grid,
         labels=dict(x="Bulan", y="Tahun", color="Titik api"),
-        color_continuous_scale="Reds",   # satu warna, terang -> gelap
+        color_continuous_scale="Reds",
         aspect="auto",
     )
     fig.update_yaxes(dtick=1)
@@ -177,12 +204,11 @@ def gambar(grid, judul):
 
 
 tab1, tabp, tab2, tab3, tab4 = st.tabs(
-    ["Kalender harmonisasi", "Peta", "Bulan berjalan",
+    ["Kalender harmonisasi", "Peta", "Perbandingan bulanan",
      "Sebelum vs sesudah", "Data"]
 )
 
 with tab1:
-    # penggeser rentang tahun
     th_min = int(harmoni.index.get_level_values("tahun").min())
     th_maks = int(harmoni.index.get_level_values("tahun").max())
     dari, sampai = st.slider("Rentang tahun", th_min, th_maks,
@@ -193,13 +219,12 @@ with tab1:
     ]
     st.plotly_chart(gambar(jadi_kalender(pilih_tahun),
                            f"Setelah harmonisasi — {satuan.lower()}"),
-                    width='stretch')
+                    width="stretch")
 
 
 with tabp:
-    # ---- peta sebaran titik api ----
     try:
-        p = pd.read_csv(f"peta_{AREA[nama_area]}.csv")
+        p = muat_peta(AREA[nama_area])
     except FileNotFoundError:
         p = None
         st.warning(
@@ -230,22 +255,15 @@ with tabp:
         p_min, p_maks = int(p["tahun"].min()), int(p["tahun"].max())
         sensor_p = p[p["sensor"] == sensor_peta]
 
-        # Skala dikunci ke sel tersibuk dalam SATU tahun, supaya tahun sepi
-        # benar-benar terlihat sepi saat animasi berjalan. Tanpa ini setiap
-        # tahun akan tampak sama parahnya.
         puncak = max(1, int(
             sensor_p.groupby(["tahun", "lat", "lon"])["n"].sum().max()
         ))
 
-        # Kamera juga dikunci, supaya petanya tidak melompat tiap ganti tahun.
         pusat_lat = float(sensor_p["lat"].mean())
         pusat_lon = float(sensor_p["lon"].mean())
         lebar = sensor_p["lat"].max() - sensor_p["lat"].min()
         zoom = 4 if lebar > 8 else (5 if lebar > 3 else 6)
 
-        # Gradien nyala: gelap -> merah -> jingga -> kuning.
-        # Dipakai di atas peta gelap, jadi bacanya tetap "makin terang
-        # berarti makin banyak" — satu arah, bukan pelangi.
         NYALA = [
             [20, 0, 0, 0], [128, 17, 0, 140], [189, 48, 7, 180],
             [230, 95, 10, 210], [247, 150, 25, 235], [255, 214, 90, 255],
@@ -270,7 +288,6 @@ with tabp:
                 peta_dasar = "dark"
             else:
                 bagian = (d2["n"] / puncak).clip(0, 1) ** 0.5
-                # radius dalam meter; akar kuadrat supaya sel kecil terlihat
                 d2["radius"] = 2_500 + bagian * 17_500
                 d2["r"] = 255 - bagian * 90
                 d2["g"] = 200 - bagian * 185
@@ -308,7 +325,7 @@ with tabp:
                                  key="tahun_tunggal")
             with s2:
                 st.write("")
-                putar = st.button("▶  Putar animasi", width='stretch')
+                putar = st.button("▶  Putar animasi", width="stretch")
 
             wadah = st.empty()
             label = st.empty()
@@ -327,7 +344,6 @@ with tabp:
                 titik = ambil(satu, satu)
                 if len(titik):
                     wadah.pydeck_chart(susun_peta(titik, gaya))
-            th_dari = th_sampai = satu
         else:
             th_dari, th_sampai = st.slider(
                 "Rentang tahun", p_min, p_maks, (p_min, p_maks),
@@ -356,27 +372,40 @@ with tabp:
 
 
 with tab2:
-    # ---- bulan berjalan dibanding median historis ----
-    # Ini yang diminta challenge: bandingkan aktivitas bulan berjalan
-    # dengan median historis bulan yang sama.
-    tahun_akhir = int(harmoni.index.get_level_values("tahun").max())
-    terakhir = harmoni.loc[tahun_akhir]
-    bulan_akhir = int(terakhir.index.max())
+    # ---- perbandingan bulan pilihan dibanding median historis ----
+    semua_tahun = sorted(harmoni.index.get_level_values("tahun").unique())
+    tahun_terbaru = int(semua_tahun[-1])
+    bulan_terbaru = int(harmoni.loc[tahun_terbaru].index.max())
 
-    nilai_kini = float(terakhir.loc[bulan_akhir])
+    p1, p2 = st.columns(2)
+    with p1:
+        tahun_pilih = st.selectbox(
+            "Tahun", semua_tahun, index=len(semua_tahun) - 1, key="tab2_tahun"
+        )
+    with p2:
+        bulan_tersedia = sorted(harmoni.loc[tahun_pilih].index.unique())
+        bulan_nama = st.selectbox(
+            "Bulan",
+            [BULAN[b - 1] for b in bulan_tersedia],
+            index=len(bulan_tersedia) - 1,
+            key="tab2_bulan",
+        )
+        bulan_pilih = BULAN.index(bulan_nama) + 1
 
-    # median bulan yang sama, dari semua tahun SEBELUMNYA
+    nilai_kini = float(harmoni.loc[(tahun_pilih, bulan_pilih)])
+
+    # Median bulan yang sama dari seluruh tahun lain dalam dataset
     sejarah = harmoni[
-        (harmoni.index.get_level_values("bulan") == bulan_akhir)
-        & (harmoni.index.get_level_values("tahun") < tahun_akhir)
+        (harmoni.index.get_level_values("bulan") == bulan_pilih)
+        & (harmoni.index.get_level_values("tahun") != tahun_pilih)
     ]
-    median_sejarah = float(sejarah.median())
+    median_sejarah = float(sejarah.median()) if len(sejarah) else 0.0
 
-    st.subheader(f"{BULAN[bulan_akhir - 1]} {tahun_akhir}")
+    st.subheader(f"{BULAN[bulan_pilih - 1]} {tahun_pilih}")
 
     k1, k2, k3 = st.columns(3)
-    k1.metric("Bulan ini", f"{nilai_kini:,.0f}")
-    k2.metric(f"Median {BULAN[bulan_akhir - 1]} ({th_min}–{tahun_akhir - 1})",
+    k1.metric("Titik api terpilih", f"{nilai_kini:,.0f}")
+    k2.metric(f"Median historis {BULAN[bulan_pilih - 1]}",
               f"{median_sejarah:,.0f}")
 
     if median_sejarah > 0:
@@ -385,26 +414,25 @@ with tab2:
                   delta=f"{selisih:+.0f}%")
         if selisih > 50:
             st.error(f"Aktivitas kebakaran **jauh di atas** median historis "
-                     f"untuk bulan {BULAN[bulan_akhir - 1]}.")
+                     f"untuk bulan {BULAN[bulan_pilih - 1]}.")
         elif selisih < -50:
             st.success("Aktivitas kebakaran jauh di bawah median historis.")
         else:
             st.info("Aktivitas kebakaran mendekati median historis.")
 
-    # perbandingan bulan ini terhadap semua tahun
     banding = sejarah.droplevel("bulan").rename("historis").to_frame()
-    banding.loc[tahun_akhir] = nilai_kini
+    banding.loc[tahun_pilih] = nilai_kini
+    banding = banding.sort_index()
     st.bar_chart(banding, height=320)
     st.caption(
-        f"Jumlah titik api bulan {BULAN[bulan_akhir - 1]} di tiap tahun. "
-        f"Batang terakhir adalah bulan berjalan."
+        f"Jumlah titik api bulan {BULAN[bulan_pilih - 1]} di tiap tahun."
     )
-    st.warning(
-        f"**Keterbatasan:** bulan {BULAN[bulan_akhir - 1]} {tahun_akhir} belum "
-        f"selesai — datanya berhenti pada tanggal unduhan. Median dihitung dari "
-        f"bulan-bulan penuh, jadi perbandingan ini bukan setara dan cenderung "
-        f"**merendahkan** aktivitas bulan berjalan."
-    )
+    if tahun_pilih == tahun_terbaru and bulan_pilih == bulan_terbaru:
+        st.warning(
+            f"**Catatan:** bulan {BULAN[bulan_pilih - 1]} {tahun_pilih} belum "
+            f"selesai — datanya berhenti pada tanggal unduhan, sehingga "
+            f"angkanya cenderung lebih rendah dibanding bulan-bulan penuh sebelumnya."
+        )
 
 with tab3:
     st.markdown(
@@ -420,7 +448,7 @@ with tab3:
 
 with tab4:
     grid = jadi_kalender(harmoni).round(0).astype(int)
-    st.dataframe(grid, width='stretch')
+    st.dataframe(grid, width="stretch")
     st.download_button(
         "Unduh CSV",
         grid.to_csv().encode("utf-8"),

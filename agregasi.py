@@ -18,8 +18,8 @@ import pandas as pd
 # ---------------------------------------------------------------- pengaturan
 
 # Kotak wilayah: (lat_min, lat_max, lon_min, lon_max). None = seluruh data.
-# Angka ini PERKIRAAN kasar - cocokkan dengan peta sebelum dipakai di
-# proposal atau presentasi.
+# Catatan: batas kotak persegi ikut mencakup sebagian wilayah daratan negara
+# tetangga di perbatasan (mis. Sarawak/Sabah pada kotak Kalimantan).
 WILAYAH = {
     "indonesia":         None,
     "kalimantan":        (-4.2, 7.4, 108.8, 119.3),
@@ -38,6 +38,7 @@ NAMA_SENSOR = {
     "M-C61": "MODIS",
     "SV-C2": "VIIRS_SNPP",
     "J1V-C2": "VIIRS_NOAA20",
+    "J2V-C2": "VIIRS_NOAA21",
 }
 
 # ----------------------------------------------------------------- pembantu
@@ -63,6 +64,18 @@ def pita_kepercayaan(seri):
     return hasil
 
 
+def buang_nrt_tumpang_tindih(df):
+    """Jika (sensor, tahun, bulan) sudah ada di 'archive', buang versi 'nrt'-nya."""
+    sudah_archive = (
+        df[df["jenis"] == "archive"][["sensor", "tahun", "bulan"]]
+        .drop_duplicates()
+        .assign(_ada_archive=True)
+    )
+    gabung = df.merge(sudah_archive, on=["sensor", "tahun", "bulan"], how="left")
+    bersih = gabung[~((gabung["jenis"] == "nrt") & (gabung["_ada_archive"] == True))]
+    return bersih.drop(columns=["_ada_archive"])
+
+
 # -------------------------------------------------------------------- utama
 
 
@@ -80,8 +93,8 @@ def main():
 
     for path in berkas:
         sensor = sensor_dari_nama(path)
-        jenis = "nrt" if "_nrt_" in os.path.basename(path) else "archive"
-        print(f"[{sensor}] {os.path.basename(path)}")
+        jenis = "nrt" if "_nrt_" in os.path.basename(path).lower() else "archive"
+        print(f"[{sensor} | {jenis}] {os.path.basename(path)}")
         total = 0
 
         pembaca = pd.read_csv(
@@ -102,6 +115,9 @@ def main():
                 lon=(potongan["longitude"] / KOTAK).round() * KOTAK,
             ).dropna(subset=["tahun", "bulan"])
 
+            potongan["tahun"] = potongan["tahun"].astype(int)
+            potongan["bulan"] = potongan["bulan"].astype(int)
+
             for w, kotak in WILAYAH.items():
                 if kotak is None:
                     bagian = potongan
@@ -120,9 +136,11 @@ def main():
                 k["jenis"] = jenis
                 kalender[w].append(k)
 
-                p = (bagian.groupby(["tahun", "lat", "lon"])
+                # Simpan jenis & bulan sementara untuk deduplikasi NRT vs Archive
+                p = (bagian.groupby(["tahun", "bulan", "lat", "lon"])
                      .size().rename("n").reset_index())
                 p["sensor"] = sensor
+                p["jenis"] = jenis
                 peta[w].append(p)
 
             print(f"    ... {total:,} baris", end="\r", flush=True)
@@ -137,12 +155,17 @@ def main():
             print(f"  {w:20s} (tidak ada data)")
             continue
 
-        k = (pd.concat(kalender[w], ignore_index=True)
-             .groupby(["sensor", "jenis", "tahun", "bulan", "pita"],
-                      as_index=False)["n"].sum())
-        p = (pd.concat(peta[w], ignore_index=True)
-             .groupby(["sensor", "tahun", "lat", "lon"],
-                      as_index=False)["n"].sum())
+        k_gabung = (pd.concat(kalender[w], ignore_index=True)
+                    .groupby(["sensor", "jenis", "tahun", "bulan", "pita"],
+                             as_index=False)["n"].sum())
+        k = buang_nrt_tumpang_tindih(k_gabung)
+
+        p_gabung = (pd.concat(peta[w], ignore_index=True)
+                    .groupby(["sensor", "jenis", "tahun", "bulan", "lat", "lon"],
+                             as_index=False)["n"].sum())
+        p_bersih = buang_nrt_tumpang_tindih(p_gabung)
+        p = (p_bersih.groupby(["sensor", "tahun", "lat", "lon"],
+                              as_index=False)["n"].sum())
 
         fk, fp = f"kalender_{w}.csv", f"peta_{w}.csv"
         k.to_csv(fk, index=False)
